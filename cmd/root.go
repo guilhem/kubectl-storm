@@ -21,10 +21,14 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gdamore/tcell/v2"
+	"github.com/google/go-cmp/cmp"
+	"github.com/rivo/tview"
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -42,12 +46,12 @@ type generationHistory struct {
 	lock        *sync.Mutex
 	lastVersion string
 	count       int
+	diffs       []string
 }
 
-// historiesMap stocke l'ensemble des historiques :
-//
-//	map[GVR]map[cle_objet]*generationHistory
-var historiesMap = make(map[schema.GroupVersionResource]map[string]*generationHistory)
+type HistoriesMap map[schema.GroupVersionResource]map[string]*generationHistory
+
+var historiesMap = make(HistoriesMap)
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -212,15 +216,15 @@ func run(ctx context.Context, config *rest.Config) error {
 						return
 					}
 
-					uid := string(obj.GetUID())
+					id := fmt.Sprintf("%s/%s", obj.GetNamespace(), obj.GetName())
 					version := obj.GetResourceVersion()
 					if version == "" {
 						return
 					}
 
 					resourceMap := historiesMap[gvr] // map[string]*generationHistory
-					if _, exists := resourceMap[uid]; !exists {
-						resourceMap[uid] = &generationHistory{
+					if _, exists := resourceMap[id]; !exists {
+						resourceMap[id] = &generationHistory{
 							lastVersion: version,
 							count:       1,
 							lock:        &sync.Mutex{},
@@ -233,7 +237,7 @@ func run(ctx context.Context, config *rest.Config) error {
 						return
 					}
 
-					uid := string(obj.GetUID())
+					id := fmt.Sprintf("%s/%s", obj.GetNamespace(), obj.GetName())
 					version := obj.GetResourceVersion()
 					if version == "" {
 						return
@@ -241,7 +245,7 @@ func run(ctx context.Context, config *rest.Config) error {
 
 					resourceMap := historiesMap[gvr] // map[string]*generationHistory
 
-					genHist := resourceMap[uid]
+					genHist := resourceMap[id]
 
 					// Compare this version with the last one
 					if version != genHist.lastVersion {
@@ -249,6 +253,12 @@ func run(ctx context.Context, config *rest.Config) error {
 						defer genHist.lock.Unlock()
 						genHist.count++
 						genHist.lastVersion = version
+
+						if genHist.count > maxGenerationChanges {
+							if len(genHist.diffs) < 5 {
+								genHist.diffs = append(genHist.diffs, cmp.Diff(oldObj, rawObj, cmp.AllowUnexported(unstructured.Unstructured{})))
+							}
+						}
 					}
 				},
 			})
@@ -267,13 +277,116 @@ func run(ctx context.Context, config *rest.Config) error {
 
 	wg.Wait()
 
-	// Print the results
+	if len(historiesMap) > 0 {
+		if err := DisplayDiffs(historiesMap); err != nil {
+			return fmt.Errorf("Can't display diffs: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func DisplayDiffs(historiesMap HistoriesMap) error {
+
+	// Filter historiesMap only with diffs
+	filteredHistoriesMap := make(HistoriesMap)
+
 	for gvr, resourceMap := range historiesMap {
-		for uid, genHist := range resourceMap {
-			if genHist.count > maxGenerationChanges {
-				logger.Info("Too many generation changes", "resource", gvr.Resource, "uid", uid, "count list", genHist.count)
+		for id, genHist := range resourceMap {
+			if len(genHist.diffs) > 0 {
+				if _, exists := filteredHistoriesMap[gvr]; !exists {
+					filteredHistoriesMap[gvr] = make(map[string]*generationHistory)
+				}
+				filteredHistoriesMap[gvr][id] = genHist
 			}
 		}
+	}
+
+	if len(filteredHistoriesMap) == 0 {
+		logger.Info("No diffs found")
+		return nil
+	}
+
+	app := tview.NewApplication()
+
+	root := tview.NewTreeNode("updated").
+		SetColor(tcell.ColorRed).
+		SetSelectable(false)
+
+	for gvr, resourceMap := range filteredHistoriesMap {
+
+		node := tview.NewTreeNode(gvr.String()).
+			SetColor(tcell.ColorYellow).
+			SetSelectable(false)
+
+		root.AddChild(node)
+
+		for id, genHist := range resourceMap {
+
+			resource := tview.NewTreeNode(id).Collapse()
+
+			node.AddChild(resource)
+
+			for i, diff := range genHist.diffs {
+				resource.AddChild(tview.NewTreeNode(strconv.Itoa(i)).
+					SetReference(diff).
+					SetSelectable(true))
+			}
+		}
+	}
+
+	tree := tview.NewTreeView().
+		SetRoot(root).
+		SetCurrentNode(root)
+
+	diffView := tview.NewTextView()
+
+	diffView.SetBorder(true).SetTitle("Diff")
+
+	tree.SetSelectedFunc(func(node *tview.TreeNode) {
+		// manage expand/collapse
+		if len(node.GetChildren()) == 0 {
+			diff := node.GetReference()
+			if diff == nil {
+				return
+			}
+			diffView.SetText(diff.(string))
+
+			return
+		}
+
+		node.SetExpanded(!node.IsExpanded())
+	})
+
+	footer := tview.NewTextView().
+		SetText("Press TAB to switch between tree and diff view.")
+
+	// Tab navigation
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyTab {
+			if app.GetFocus() == tree {
+				app.SetFocus(diffView)
+			} else {
+				app.SetFocus(tree)
+			}
+			return nil
+		}
+		return event
+	})
+
+	flex := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(
+			tview.NewFlex().
+				SetDirection(tview.FlexColumn).
+				AddItem(tree, 0, 1, true).
+				AddItem(diffView, 0, 2, false),
+			0, 1, true,
+		).
+		AddItem(footer, 1, 1, false)
+
+	if err := app.SetRoot(flex, true).SetFocus(tree).Run(); err != nil {
+		return fmt.Errorf("Can't run tview: %v", err)
 	}
 
 	return nil
