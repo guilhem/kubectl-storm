@@ -4,6 +4,11 @@ on:
     tags:
       - "v*.*.*"
 
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
@@ -27,6 +32,10 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-checksums: ./dist/checksums.txt
 
       - name: Update new version in krew-index
         uses: rajatjindal/krew-release-bot@v0.0.47
