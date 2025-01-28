@@ -24,9 +24,8 @@ spec:
         arch: amd64
     {{addURIAndSha "https://github.com/guilhem/kubectl-storm/releases/download/{{ .TagName }}/kubectl-storm_{{ .TagName }}_linux_amd64.tar.gz" .TagName }}
     bin: kubectl-storm
-  shortDescription: Detect update storm
+  shortDescription: A Kubernetes plugin to detect, analyze, and visualize excessive generation changes in resources with detailed diffs.
   description: |
-    Usage:
-      kubectl storm
-      This plugin detect changes on resources.
-      Read more documentation at: https://github.com/guilhem/kubectl-storm
+    A Kubernetes plugin designed to monitor and analyze excessive generation changes in resources.
+    It detects rapid updates to Kubernetes resource generations, providing detailed diffs and a visual interface for debugging.
+    The tool supports filtering by resource types and employs a user-friendly terminal interface to display updates and differences, making it easier to identify and address potential issues caused by high-frequency changes in resource configurations.
