@@ -23,6 +23,9 @@ builds:
       - windows
       - darwin
 
+checksum:
+  name_template: "checksums.txt"
+
 archives:
   - formats:
       - tar.gz
