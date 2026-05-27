@@ -4,8 +4,10 @@ import (
 	"strings"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 var deploymentGVR = schema.GroupVersionResource{
@@ -167,6 +169,29 @@ func TestTrackerReplacementUpdateUsesUID(t *testing.T) {
 	}
 }
 
+func TestTrackerAcceptsPartialObjectMetadata(t *testing.T) {
+	tracker := NewChangeTracker(signalResourceVersion, 2, 5)
+	first := testMetadataObject("default", "api", "uid-api", "1", 1)
+	second := testMetadataObject("default", "api", "uid-api", "2", 1)
+	third := testMetadataObject("default", "api", "uid-api", "3", 1)
+
+	tracker.ObserveAdd(deploymentGVR, first)
+	tracker.ObserveUpdate(deploymentGVR, first, second)
+	observation := tracker.ObserveUpdate(deploymentGVR, second, third)
+
+	if !observation.Hot {
+		t.Fatal("third observed value should be hot")
+	}
+
+	history := historyByID(t, tracker.Snapshot(), deploymentGVR, "default/api")
+	if history.Count != 3 {
+		t.Fatalf("count = %d, want 3", history.Count)
+	}
+	if len(history.Diffs) != 0 {
+		t.Fatalf("metadata tracker should not create full diffs by itself, got %d", len(history.Diffs))
+	}
+}
+
 func TestSanitizeDiffRemovesVolatileFields(t *testing.T) {
 	oldObj := testObject("default", "api", "1", 1, "nginx:1")
 	newObj := testObject("default", "api", "2", 2, "nginx:2")
@@ -179,6 +204,18 @@ func TestSanitizeDiffRemovesVolatileFields(t *testing.T) {
 	}
 	if !strings.Contains(diff, "nginx:2") {
 		t.Fatalf("diff should include spec change: %s", diff)
+	}
+}
+
+func testMetadataObject(namespace, name, uid, resourceVersion string, generation int64) *metav1.PartialObjectMetadata {
+	return &metav1.PartialObjectMetadata{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       namespace,
+			UID:             types.UID(uid),
+			ResourceVersion: resourceVersion,
+			Generation:      generation,
+		},
 	}
 }
 

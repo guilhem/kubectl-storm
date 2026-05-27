@@ -5,9 +5,22 @@ import (
 	"sync"
 
 	"github.com/google/go-cmp/cmp"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+type ObservedObject interface {
+	metav1.Object
+}
+
+type Observation struct {
+	Key     string
+	ID      string
+	Count   int
+	Changed bool
+	Hot     bool
+}
 
 type ResourceHistory struct {
 	ID        string
@@ -37,14 +50,14 @@ func NewChangeTracker(signal changeSignal, threshold, maxDiffs int) *ChangeTrack
 	}
 }
 
-func (t *ChangeTracker) ObserveAdd(gvr schema.GroupVersionResource, obj *unstructured.Unstructured) {
+func (t *ChangeTracker) ObserveAdd(gvr schema.GroupVersionResource, obj ObservedObject) Observation {
 	if obj == nil {
-		return
+		return Observation{}
 	}
 
 	value, ok := t.signalValue(obj)
 	if !ok {
-		return
+		return Observation{}
 	}
 
 	t.lock.Lock()
@@ -62,25 +75,26 @@ func (t *ChangeTracker) ObserveAdd(gvr schema.GroupVersionResource, obj *unstruc
 			history.Count = 1
 		}
 		resourceMap[key] = history
-		return
+		return t.observation(key, history, false)
 	}
-	resourceMap[key] = newResourceHistory(obj, value, 1)
+	history = newResourceHistory(obj, value, 1)
+	resourceMap[key] = history
+	return t.observation(key, history, false)
 }
 
-func (t *ChangeTracker) ObserveUpdate(gvr schema.GroupVersionResource, oldObj, newObj *unstructured.Unstructured) {
+func (t *ChangeTracker) ObserveUpdate(gvr schema.GroupVersionResource, oldObj, newObj ObservedObject) Observation {
 	if newObj == nil {
-		return
+		return Observation{}
 	}
 
 	if isReplacementUpdate(oldObj, newObj) {
 		t.ObserveDelete(gvr, oldObj)
-		t.ObserveAdd(gvr, newObj)
-		return
+		return t.ObserveAdd(gvr, newObj)
 	}
 
 	newValue, ok := t.signalValue(newObj)
 	if !ok {
-		return
+		return Observation{}
 	}
 
 	key := resourceKey(newObj)
@@ -97,8 +111,9 @@ func (t *ChangeTracker) ObserveUpdate(gvr schema.GroupVersionResource, oldObj, n
 			}
 		}
 		if history.Count == 0 {
-			resourceMap[key] = newResourceHistory(newObj, newValue, 1)
-			return
+			history = newResourceHistory(newObj, newValue, 1)
+			resourceMap[key] = history
+			return t.observation(key, history, false)
 		}
 	}
 
@@ -107,7 +122,7 @@ func (t *ChangeTracker) ObserveUpdate(gvr schema.GroupVersionResource, oldObj, n
 		history.UID = resourceUID(newObj)
 		history.Deleted = false
 		resourceMap[key] = history
-		return
+		return t.observation(key, history, false)
 	}
 
 	history.Count++
@@ -116,12 +131,17 @@ func (t *ChangeTracker) ObserveUpdate(gvr schema.GroupVersionResource, oldObj, n
 	history.UID = resourceUID(newObj)
 	history.Deleted = false
 	if history.Count > t.threshold && len(history.Diffs) < t.maxDiffs {
-		history.Diffs = append(history.Diffs, diffObjects(t.signal, oldObj, newObj))
+		oldUnstructured, oldOK := oldObj.(*unstructured.Unstructured)
+		newUnstructured, newOK := newObj.(*unstructured.Unstructured)
+		if oldOK && newOK {
+			history.Diffs = append(history.Diffs, diffObjects(t.signal, oldUnstructured, newUnstructured))
+		}
 	}
 	resourceMap[key] = history
+	return t.observation(key, history, true)
 }
 
-func (t *ChangeTracker) ObserveDelete(gvr schema.GroupVersionResource, obj *unstructured.Unstructured) {
+func (t *ChangeTracker) ObserveDelete(gvr schema.GroupVersionResource, obj ObservedObject) {
 	if obj == nil {
 		return
 	}
@@ -155,6 +175,25 @@ func (t *ChangeTracker) ObserveDelete(gvr schema.GroupVersionResource, obj *unst
 	resourceMap[key] = history
 }
 
+func (t *ChangeTracker) AddDiff(gvr schema.GroupVersionResource, key, diff string) bool {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	resourceMap, exists := t.histories[gvr]
+	if !exists {
+		return false
+	}
+
+	history, exists := resourceMap[key]
+	if !exists || len(history.Diffs) >= t.maxDiffs {
+		return false
+	}
+
+	history.Diffs = append(history.Diffs, diff)
+	resourceMap[key] = history
+	return true
+}
+
 func (t *ChangeTracker) Snapshot() HistoriesMap {
 	t.lock.Lock()
 	defer t.lock.Unlock()
@@ -181,7 +220,17 @@ func (t *ChangeTracker) resourceMap(gvr schema.GroupVersionResource) map[string]
 	return resourceMap
 }
 
-func newResourceHistory(obj *unstructured.Unstructured, value string, count int) ResourceHistory {
+func (t *ChangeTracker) observation(key string, history ResourceHistory, changed bool) Observation {
+	return Observation{
+		Key:     key,
+		ID:      history.ID,
+		Count:   history.Count,
+		Changed: changed,
+		Hot:     history.Count > t.threshold,
+	}
+}
+
+func newResourceHistory(obj ObservedObject, value string, count int) ResourceHistory {
 	return ResourceHistory{
 		ID:        resourceID(obj),
 		UID:       resourceUID(obj),
@@ -190,7 +239,7 @@ func newResourceHistory(obj *unstructured.Unstructured, value string, count int)
 	}
 }
 
-func (t *ChangeTracker) signalValue(obj *unstructured.Unstructured) (string, bool) {
+func (t *ChangeTracker) signalValue(obj ObservedObject) (string, bool) {
 	switch t.signal {
 	case signalGeneration:
 		return fmt.Sprintf("%d", obj.GetGeneration()), true
@@ -202,18 +251,18 @@ func (t *ChangeTracker) signalValue(obj *unstructured.Unstructured) (string, boo
 	}
 }
 
-func resourceID(obj *unstructured.Unstructured) string {
+func resourceID(obj ObservedObject) string {
 	if obj.GetNamespace() == "" {
 		return obj.GetName()
 	}
 	return fmt.Sprintf("%s/%s", obj.GetNamespace(), obj.GetName())
 }
 
-func resourceUID(obj *unstructured.Unstructured) string {
+func resourceUID(obj ObservedObject) string {
 	return string(obj.GetUID())
 }
 
-func resourceKey(obj *unstructured.Unstructured) string {
+func resourceKey(obj ObservedObject) string {
 	id := resourceID(obj)
 	uid := resourceUID(obj)
 	if uid == "" {
@@ -222,7 +271,7 @@ func resourceKey(obj *unstructured.Unstructured) string {
 	return fmt.Sprintf("%s#%s", id, uid)
 }
 
-func isReplacementUpdate(oldObj, newObj *unstructured.Unstructured) bool {
+func isReplacementUpdate(oldObj, newObj ObservedObject) bool {
 	if oldObj == nil || newObj == nil {
 		return false
 	}
@@ -232,7 +281,11 @@ func isReplacementUpdate(oldObj, newObj *unstructured.Unstructured) bool {
 }
 
 func diffObjects(signal changeSignal, oldObj, newObj *unstructured.Unstructured) string {
-	return cmp.Diff(sanitizeForDiff(signal, oldObj), sanitizeForDiff(signal, newObj))
+	return diffSanitized(sanitizeForDiff(signal, oldObj), sanitizeForDiff(signal, newObj))
+}
+
+func diffSanitized(oldObj, newObj any) string {
+	return cmp.Diff(oldObj, newObj)
 }
 
 func sanitizeForDiff(signal changeSignal, obj *unstructured.Unstructured) any {

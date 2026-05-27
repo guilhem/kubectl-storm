@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -32,11 +33,16 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/metadata"
+	"k8s.io/client-go/metadata/metadatainformer"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	cliflag "k8s.io/component-base/cli/flag"
@@ -46,22 +52,39 @@ import (
 const (
 	defaultRunDuration     = time.Minute
 	defaultChangeThreshold = 5
+	defaultMaxDiffs        = 5
+)
+
+type watchMode string
+
+const (
+	watchModeFull     watchMode = "full"
+	watchModeMetadata watchMode = "metadata"
 )
 
 type runOptions struct {
 	runDuration     time.Duration
 	changeThreshold int
 	signal          changeSignal
+	watchMode       watchMode
 	includeFilters  []string
 	excludeFilters  []string
+	namespaceScope  string
+	allNamespaces   bool
+	labelSelector   string
+	fieldSelector   string
+	watchListLimit  int64
 	kubeAPIQPS      float32
 	kubeAPIBurst    int
+	readOnly        bool
 }
 
 var options = runOptions{
 	runDuration:     defaultRunDuration,
 	changeThreshold: defaultChangeThreshold,
 	signal:          signalResourceVersion,
+	watchMode:       watchModeFull,
+	readOnly:        true,
 }
 
 var logger *slog.Logger
@@ -104,10 +127,17 @@ func init() {
 	run.IntVarP(&options.changeThreshold, "generation-changes", "g", defaultChangeThreshold, "Deprecated alias for --change-threshold.")
 	_ = run.MarkDeprecated("generation-changes", "use --change-threshold instead")
 	run.Var(&options.signal, "signal", "Signal to observe: resource-version or generation.")
+	run.Var(&options.watchMode, "watch-mode", "Watch mode: full or metadata.")
 	run.StringArrayVar(&options.includeFilters, "include-resource", nil, "Only watch this resource, repeatable. Format: group/version/resource, core/v1/pods, or /v1/pods.")
 	run.StringArrayVar(&options.excludeFilters, "exclude-resource", nil, "Exclude this resource, repeatable. Format: group/version/resource, core/v1/pods, or /v1/pods.")
+	run.StringVar(&options.namespaceScope, "namespace-scope", "", "Only watch resources in this namespace. By default all namespaces are watched.")
+	run.BoolVar(&options.allNamespaces, "all-namespaces", false, "Explicitly watch all namespaces. This is already the default unless --namespace-scope is set.")
+	run.StringVar(&options.labelSelector, "label-selector", "", "Label selector applied to watched list/watch requests.")
+	run.StringVar(&options.fieldSelector, "field-selector", "", "Field selector applied to watched list/watch requests.")
+	run.Int64Var(&options.watchListLimit, "watch-list-page-size", 0, "Requested page size for watched list requests. Use 0 to let client-go decide.")
 	run.Float32Var(&options.kubeAPIQPS, "kube-api-qps", 0, "Override Kubernetes API client QPS. Use 0 to keep the kubeconfig/client-go default.")
 	run.IntVar(&options.kubeAPIBurst, "kube-api-burst", 0, "Override Kubernetes API client burst. Use 0 to keep the kubeconfig/client-go default.")
+	run.BoolVar(&options.readOnly, "read-only", true, "Block non-read Kubernetes API requests before they reach the API server.")
 
 	rootCmd.Flags().AddFlagSet(run)
 
@@ -148,51 +178,25 @@ func run(ctx context.Context, config *rest.Config, opts runOptions) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 0)
-	tracker := NewChangeTracker(opts.signal, opts.changeThreshold, 5)
+	factory, err := newResourceInformerFactory(config, dynamicClient, opts)
+	if err != nil {
+		return err
+	}
+
+	tracker := NewChangeTracker(opts.signal, opts.changeThreshold, defaultMaxDiffs)
+	diffRecorder := newMetadataDiffRecorder(dynamicFullObjectGetter{client: dynamicClient}, tracker, defaultMaxDiffs)
+	if normalizedWatchMode(opts.watchMode) != watchModeMetadata {
+		diffRecorder = nil
+	}
 	watchResources := selectWatchResources(apiResourceLists, include, exclude)
 
-	noResync := time.Duration(0)
 	handlerSyncs := make([]cache.InformerSynced, 0, len(watchResources))
 	for _, watchResource := range watchResources {
-		gvr := watchResource.GVR
-		informer := factory.ForResource(gvr).Informer()
-		if err := informer.SetTransform(stripManagedFieldsTransform); err != nil {
-			return fmt.Errorf("can't set transform for %s: %w", gvr.String(), err)
-		}
-		registration, err := informer.AddEventHandlerWithOptions(cache.ResourceEventHandlerDetailedFuncs{
-			AddFunc: func(rawObj interface{}, _ bool) {
-				if obj, ok := unstructuredFromObject(rawObj); ok {
-					tracker.ObserveAdd(gvr, obj)
-				}
-			},
-			UpdateFunc: func(oldObj, rawObj interface{}) {
-				oldUnstructured, oldOK := oldObj.(*unstructured.Unstructured)
-				newUnstructured, newOK := rawObj.(*unstructured.Unstructured)
-				if !newOK {
-					return
-				}
-				if !oldOK {
-					oldUnstructured = newUnstructured
-				}
-				tracker.ObserveUpdate(gvr, oldUnstructured, newUnstructured)
-			},
-			DeleteFunc: func(rawObj interface{}) {
-				if obj, ok := unstructuredFromObject(rawObj); ok {
-					tracker.ObserveDelete(gvr, obj)
-				}
-			},
-		}, cache.HandlerOptions{ResyncPeriod: &noResync})
+		handlerSync, err := registerWatchResourceHandler(ctx, factory, watchResource.GVR, tracker, diffRecorder)
 		if err != nil {
-			return fmt.Errorf("can't add event handler for %s: %w", gvr.String(), err)
+			return err
 		}
-		handlerSyncs = append(handlerSyncs, registration.HasSynced)
-
-		if err := informer.SetWatchErrorHandler(func(r *cache.Reflector, err error) {
-			logger.Error("error in watch", "resource", gvr.String(), "error", err)
-		}); err != nil {
-			return fmt.Errorf("can't set watch error handler for %s: %w", gvr.String(), err)
-		}
+		handlerSyncs = append(handlerSyncs, handlerSync)
 	}
 
 	watchCtx, cancelWatch := context.WithCancel(ctx)
@@ -210,12 +214,71 @@ func run(ctx context.Context, config *rest.Config, opts runOptions) error {
 	return DisplayDiffs(tracker.Snapshot())
 }
 
+func (m watchMode) String() string {
+	if m == "" {
+		return string(watchModeFull)
+	}
+	return string(m)
+}
+
+func (m *watchMode) Set(value string) error {
+	mode := watchMode(value)
+	if !mode.Valid() {
+		return fmt.Errorf("watch mode must be one of: %s", strings.Join(validWatchModes(), ", "))
+	}
+	*m = mode
+	return nil
+}
+
+func (m watchMode) Type() string {
+	return "watch-mode"
+}
+
+func (m watchMode) Valid() bool {
+	switch m {
+	case "", watchModeFull, watchModeMetadata:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizedWatchMode(mode watchMode) watchMode {
+	if mode == "" {
+		return watchModeFull
+	}
+	return mode
+}
+
+func validWatchModes() []string {
+	return []string{string(watchModeFull), string(watchModeMetadata)}
+}
+
 func validateOptions(opts runOptions) error {
 	if opts.changeThreshold < 1 {
 		return fmt.Errorf("--change-threshold must be greater than 0")
 	}
 	if !opts.signal.Valid() {
 		return fmt.Errorf("--signal must be one of: %s", strings.Join(validSignals(), ", "))
+	}
+	if !opts.watchMode.Valid() {
+		return fmt.Errorf("--watch-mode must be one of: %s", strings.Join(validWatchModes(), ", "))
+	}
+	if opts.namespaceScope != "" && opts.allNamespaces {
+		return fmt.Errorf("--namespace-scope and --all-namespaces can't be used together")
+	}
+	if opts.labelSelector != "" {
+		if _, err := labels.Parse(opts.labelSelector); err != nil {
+			return fmt.Errorf("--label-selector is invalid: %w", err)
+		}
+	}
+	if opts.fieldSelector != "" {
+		if _, err := fields.ParseSelector(opts.fieldSelector); err != nil {
+			return fmt.Errorf("--field-selector is invalid: %w", err)
+		}
+	}
+	if opts.watchListLimit < 0 {
+		return fmt.Errorf("--watch-list-page-size must be greater than or equal to 0")
 	}
 	if opts.kubeAPIQPS < 0 {
 		return fmt.Errorf("--kube-api-qps must be greater than or equal to 0")
@@ -237,7 +300,73 @@ func configWithKubeAPIOverrides(config *rest.Config, opts runOptions) *rest.Conf
 	if opts.kubeAPIBurst > 0 {
 		copied.Burst = opts.kubeAPIBurst
 	}
+	if opts.readOnly {
+		copied.Wrap(readOnlyTransportWrapper)
+	}
 	return copied
+}
+
+func readOnlyTransportWrapper(rt http.RoundTripper) http.RoundTripper {
+	return readOnlyRoundTripper{next: rt}
+}
+
+type readOnlyRoundTripper struct {
+	next http.RoundTripper
+}
+
+func (r readOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return r.next.RoundTrip(req)
+	default:
+		return nil, fmt.Errorf("read-only client blocked %s %s", req.Method, req.URL.String())
+	}
+}
+
+func namespaceForWatch(opts runOptions) string {
+	if opts.namespaceScope != "" {
+		return opts.namespaceScope
+	}
+	return v1.NamespaceAll
+}
+
+func listOptionsTweak(opts runOptions) func(*v1.ListOptions) {
+	return func(listOptions *v1.ListOptions) {
+		if opts.labelSelector != "" {
+			listOptions.LabelSelector = opts.labelSelector
+		}
+		if opts.fieldSelector != "" {
+			listOptions.FieldSelector = opts.fieldSelector
+		}
+		if opts.watchListLimit > 0 {
+			listOptions.Limit = opts.watchListLimit
+		}
+	}
+}
+
+type resourceInformerFactory interface {
+	ForResource(gvr schema.GroupVersionResource) informers.GenericInformer
+	Start(stopCh <-chan struct{})
+	WaitForCacheSync(stopCh <-chan struct{}) map[schema.GroupVersionResource]bool
+	Shutdown()
+}
+
+func newResourceInformerFactory(config *rest.Config, dynamicClient dynamic.Interface, opts runOptions) (resourceInformerFactory, error) {
+	namespace := namespaceForWatch(opts)
+	tweakListOptions := listOptionsTweak(opts)
+
+	switch normalizedWatchMode(opts.watchMode) {
+	case watchModeFull:
+		return dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynamicClient, 0, namespace, tweakListOptions), nil
+	case watchModeMetadata:
+		metadataClient, err := metadata.NewForConfig(config)
+		if err != nil {
+			return nil, fmt.Errorf("can't create metadata client: %w", err)
+		}
+		return metadatainformer.NewFilteredSharedInformerFactory(metadataClient, 0, namespace, tweakListOptions), nil
+	default:
+		return nil, fmt.Errorf("unsupported watch mode %q", opts.watchMode)
+	}
 }
 
 type resourceDiscoveryClient interface {
@@ -355,30 +484,148 @@ func hasVerb(verbs []string, want string) bool {
 }
 
 func stripManagedFieldsTransform(rawObj interface{}) (interface{}, error) {
-	obj, ok := rawObj.(*unstructured.Unstructured)
-	if !ok {
+	switch obj := rawObj.(type) {
+	case *unstructured.Unstructured:
+		copied := obj.DeepCopy()
+		unstructured.RemoveNestedField(copied.Object, "metadata", "managedFields")
+		return copied, nil
+	case *v1.PartialObjectMetadata:
+		copied := obj.DeepCopy()
+		copied.ManagedFields = nil
+		return copied, nil
+	default:
 		return rawObj, nil
 	}
-
-	copied := obj.DeepCopy()
-	unstructured.RemoveNestedField(copied.Object, "metadata", "managedFields")
-	return copied, nil
 }
 
-func unstructuredFromObject(rawObj interface{}) (*unstructured.Unstructured, bool) {
+type diffRecorder interface {
+	Capture(ctx context.Context, gvr schema.GroupVersionResource, obj ObservedObject, observation Observation)
+}
+
+func registerWatchResourceHandler(ctx context.Context, factory resourceInformerFactory, gvr schema.GroupVersionResource, tracker *ChangeTracker, recorder diffRecorder) (cache.InformerSynced, error) {
+	informer := factory.ForResource(gvr).Informer()
+	if err := informer.SetTransform(stripManagedFieldsTransform); err != nil {
+		return nil, fmt.Errorf("can't set transform for %s: %w", gvr.String(), err)
+	}
+
+	noResync := time.Duration(0)
+	registration, err := informer.AddEventHandlerWithOptions(cache.ResourceEventHandlerDetailedFuncs{
+		AddFunc: func(rawObj interface{}, _ bool) {
+			if obj, ok := observedFromObject(rawObj); ok {
+				tracker.ObserveAdd(gvr, obj)
+			}
+		},
+		UpdateFunc: func(oldObj, rawObj interface{}) {
+			oldObserved, oldOK := observedFromObject(oldObj)
+			newObserved, newOK := observedFromObject(rawObj)
+			if !newOK {
+				return
+			}
+			if !oldOK {
+				oldObserved = newObserved
+			}
+			observation := tracker.ObserveUpdate(gvr, oldObserved, newObserved)
+			if recorder != nil {
+				recorder.Capture(ctx, gvr, newObserved, observation)
+			}
+		},
+		DeleteFunc: func(rawObj interface{}) {
+			if obj, ok := observedFromObject(rawObj); ok {
+				tracker.ObserveDelete(gvr, obj)
+			}
+		},
+	}, cache.HandlerOptions{ResyncPeriod: &noResync})
+	if err != nil {
+		return nil, fmt.Errorf("can't add event handler for %s: %w", gvr.String(), err)
+	}
+
+	if err := informer.SetWatchErrorHandler(func(r *cache.Reflector, err error) {
+		logger.Error("error in watch", "resource", gvr.String(), "error", err)
+	}); err != nil {
+		return nil, fmt.Errorf("can't set watch error handler for %s: %w", gvr.String(), err)
+	}
+
+	return registration.HasSynced, nil
+}
+
+func observedFromObject(rawObj interface{}) (ObservedObject, bool) {
 	switch obj := rawObj.(type) {
 	case *unstructured.Unstructured:
 		return obj, true
+	case *v1.PartialObjectMetadata:
+		return obj, true
 	case cache.DeletedFinalStateUnknown:
-		return unstructuredFromObject(obj.Obj)
+		return observedFromObject(obj.Obj)
 	case *cache.DeletedFinalStateUnknown:
-		return unstructuredFromObject(obj.Obj)
+		return observedFromObject(obj.Obj)
 	default:
 		return nil, false
 	}
 }
 
-func waitForInformerSync(ctx context.Context, factory dynamicinformer.DynamicSharedInformerFactory, handlerSyncs []cache.InformerSynced) bool {
+type fullObjectGetter interface {
+	Get(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, error)
+}
+
+type dynamicFullObjectGetter struct {
+	client dynamic.Interface
+}
+
+func (g dynamicFullObjectGetter) Get(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, error) {
+	return g.client.Resource(gvr).Namespace(namespace).Get(ctx, name, v1.GetOptions{})
+}
+
+type metadataDiffRecorder struct {
+	getter       fullObjectGetter
+	tracker      *ChangeTracker
+	maxSnapshots int
+	snapshots    map[schema.GroupVersionResource]map[string][]any
+}
+
+func newMetadataDiffRecorder(getter fullObjectGetter, tracker *ChangeTracker, maxDiffs int) *metadataDiffRecorder {
+	return &metadataDiffRecorder{
+		getter:       getter,
+		tracker:      tracker,
+		maxSnapshots: maxDiffs + 1,
+		snapshots:    make(map[schema.GroupVersionResource]map[string][]any),
+	}
+}
+
+func (r *metadataDiffRecorder) Capture(ctx context.Context, gvr schema.GroupVersionResource, obj ObservedObject, observation Observation) {
+	if r == nil || !observation.Changed || !observation.Hot || observation.Key == "" {
+		return
+	}
+
+	resourceSnapshots := r.snapshots[gvr]
+	if resourceSnapshots == nil {
+		resourceSnapshots = make(map[string][]any)
+		r.snapshots[gvr] = resourceSnapshots
+	}
+
+	snapshots := resourceSnapshots[observation.Key]
+	if len(snapshots) >= r.maxSnapshots {
+		return
+	}
+
+	fullObj, err := r.getter.Get(ctx, gvr, obj.GetNamespace(), obj.GetName())
+	if err != nil {
+		logger.Warn("can't fetch full object for metadata diff", "resource", gvr.String(), "id", observation.ID, "error", err)
+		return
+	}
+
+	snapshot := sanitizeForDiff(r.tracker.signal, fullObj)
+	if len(snapshots) == 0 {
+		resourceSnapshots[observation.Key] = append(snapshots, snapshot)
+		r.tracker.AddDiff(gvr, observation.Key, "metadata mode: captured first full snapshot; diff will be available after the next hot change")
+		return
+	}
+
+	previous := snapshots[len(snapshots)-1]
+	resourceSnapshots[observation.Key] = append(snapshots, snapshot)
+	r.tracker.AddDiff(gvr, observation.Key, diffSanitized(previous, snapshot))
+}
+
+func waitForInformerSync(ctx context.Context, factory resourceInformerFactory, handlerSyncs []cache.InformerSynced) bool {
 	for gvr, synced := range factory.WaitForCacheSync(ctx.Done()) {
 		if !synced {
 			logger.Warn("informer cache did not sync", "resource", gvr.String())
