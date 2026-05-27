@@ -31,11 +31,14 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 	"github.com/spf13/cobra"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
@@ -410,17 +413,11 @@ func discoverAPIResources(discoveryClient resourceDiscoveryClient, include resou
 }
 
 func sortedIncludedGroupVersions(include resourceMatcher) []string {
-	groupVersions := make(map[string]struct{})
+	groupVersions := sets.New[string]()
 	for gvr := range include {
-		groupVersions[gvr.GroupVersion().String()] = struct{}{}
+		groupVersions.Insert(gvr.GroupVersion().String())
 	}
-
-	sorted := make([]string, 0, len(groupVersions))
-	for groupVersion := range groupVersions {
-		sorted = append(sorted, groupVersion)
-	}
-	sort.Strings(sorted)
-	return sorted
+	return sets.List(groupVersions)
 }
 
 type watchResource struct {
@@ -441,11 +438,7 @@ func selectWatchResources(apiResourceLists []*v1.APIResourceList, include, exclu
 		}
 
 		for _, resource := range apiResourceList.APIResources {
-			gvr := schema.GroupVersionResource{
-				Group:    gv.Group,
-				Version:  gv.Version,
-				Resource: resource.Name,
-			}
+			gvr := gv.WithResource(resource.Name)
 			if shouldWatchResource(gvr, resource, include, exclude) {
 				watchResources = append(watchResources, watchResource{
 					GVR:         gvr,
@@ -465,7 +458,7 @@ func shouldWatchResource(gvr schema.GroupVersionResource, resource v1.APIResourc
 	if strings.Contains(resource.Name, "/") {
 		return false
 	}
-	if !hasVerb(resource.Verbs, "list") || !hasVerb(resource.Verbs, "watch") {
+	if !sets.New(resource.Verbs...).HasAll("list", "watch") {
 		return false
 	}
 	if exclude.Matches(gvr) {
@@ -474,28 +467,19 @@ func shouldWatchResource(gvr schema.GroupVersionResource, resource v1.APIResourc
 	return include.Empty() || include.Matches(gvr)
 }
 
-func hasVerb(verbs []string, want string) bool {
-	for _, verb := range verbs {
-		if verb == want {
-			return true
-		}
-	}
-	return false
-}
-
 func stripManagedFieldsTransform(rawObj interface{}) (interface{}, error) {
-	switch obj := rawObj.(type) {
-	case *unstructured.Unstructured:
-		copied := obj.DeepCopy()
-		unstructured.RemoveNestedField(copied.Object, "metadata", "managedFields")
-		return copied, nil
-	case *v1.PartialObjectMetadata:
-		copied := obj.DeepCopy()
-		copied.ManagedFields = nil
-		return copied, nil
-	default:
+	obj, ok := rawObj.(runtime.Object)
+	if !ok {
 		return rawObj, nil
 	}
+
+	copied := obj.DeepCopyObject()
+	meta, err := apimeta.Accessor(copied)
+	if err != nil {
+		return rawObj, nil
+	}
+	meta.SetManagedFields(nil)
+	return copied, nil
 }
 
 type diffRecorder interface {
@@ -550,16 +534,13 @@ func registerWatchResourceHandler(ctx context.Context, factory resourceInformerF
 
 func observedFromObject(rawObj interface{}) (ObservedObject, bool) {
 	switch obj := rawObj.(type) {
-	case *unstructured.Unstructured:
-		return obj, true
-	case *v1.PartialObjectMetadata:
-		return obj, true
 	case cache.DeletedFinalStateUnknown:
 		return observedFromObject(obj.Obj)
 	case *cache.DeletedFinalStateUnknown:
 		return observedFromObject(obj.Obj)
 	default:
-		return nil, false
+		meta, err := apimeta.Accessor(rawObj)
+		return meta, err == nil
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/cache"
 )
 
 type ObservedObject interface {
@@ -252,6 +253,10 @@ func (t *ChangeTracker) signalValue(obj ObservedObject) (string, bool) {
 }
 
 func resourceID(obj ObservedObject) string {
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err == nil {
+		return key
+	}
 	if obj.GetNamespace() == "" {
 		return obj.GetName()
 	}
