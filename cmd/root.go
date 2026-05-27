@@ -20,16 +20,17 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"slices"
-	"strconv"
+	"os/signal"
+	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/google/go-cmp/cmp"
 	"github.com/rivo/tview"
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -42,79 +43,74 @@ import (
 	"k8s.io/klog/v2"
 )
 
-type generationHistory struct {
-	lock        *sync.Mutex
-	lastVersion string
-	count       int
-	diffs       []string
+const (
+	defaultRunDuration     = time.Minute
+	defaultChangeThreshold = 5
+)
+
+type runOptions struct {
+	runDuration     time.Duration
+	changeThreshold int
+	signal          changeSignal
+	includeFilters  []string
+	excludeFilters  []string
 }
 
-type HistoriesMap map[schema.GroupVersionResource]map[string]*generationHistory
-
-var historiesMap = make(HistoriesMap)
-
-// rootCmd represents the base command when called without any subcommands
-var rootCmd = &cobra.Command{
-	Use:          "kubectl-storm",
-	Short:        "A tool to detect too many generation changes in Kubernetes resources",
-	Long:         `kubectl-storm is a tool to detect too many generation changes in Kubernetes resources.`,
-	SilenceUsage: true,
-	// Uncomment the following line if your bare application
-	// has an action associated with it:
-	RunE: func(cmd *cobra.Command, args []string) error {
-		config, err := configFlags.ToRESTConfig()
-		if err != nil {
-			return fmt.Errorf("Can't recover config get: %v", err)
-		}
-		return run(cmd.Context(), config)
-	},
+var options = runOptions{
+	runDuration:     defaultRunDuration,
+	changeThreshold: defaultChangeThreshold,
+	signal:          signalResourceVersion,
 }
+
+var logger *slog.Logger
 
 var configFlags = genericclioptions.NewConfigFlags(true)
 
-// Execute adds all child commands to the root command and sets flags appropriately.
-// This is called by main.main(). It only needs to happen once to the rootCmd.
+var rootCmd = &cobra.Command{
+	Use:          "kubectl-storm",
+	Short:        "Detect excessive Kubernetes resource changes",
+	Long:         `kubectl-storm detects excessive Kubernetes resource changes and shows useful diffs for investigation.`,
+	SilenceUsage: true,
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		return validateOptions(options)
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		config, err := configFlags.ToRESTConfig()
+		if err != nil {
+			return fmt.Errorf("can't recover config: %w", err)
+		}
+		return run(cmd.Context(), config, options)
+	},
+}
+
 func Execute() {
-	err := rootCmd.Execute()
-	if err != nil {
+	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
 }
 
-var runDuration time.Duration
-var maxGenerationChanges int
-
-var logger *slog.Logger
-
 func init() {
 	logger = slog.Default()
-
 	klog.SetSlogLogger(logger)
+	slog.SetLogLoggerLevel(slog.LevelInfo)
 
 	namedFlagSet := cliflag.NamedFlagSets{}
 
 	run := namedFlagSet.FlagSet("run")
-
-	// 1m in time.Duration
-	defaultDuration, _ := time.ParseDuration("1m")
-	run.DurationVarP(&runDuration, "run-duration", "r", defaultDuration, "Run duration")
-	run.IntVarP(&maxGenerationChanges, "generation-changes", "g", 5, "Generation changes")
-
-	// parse log level
-	slog.SetLogLoggerLevel(slog.LevelInfo)
-
-	// Cobra also supports local flags, which will only run
-	// when this action is called directly.
-	run.BoolP("toggle", "t", false, "Help message for toggle")
+	run.DurationVarP(&options.runDuration, "run-duration", "r", defaultRunDuration, "Run duration. Use 0 to run until interrupted.")
+	run.IntVar(&options.changeThreshold, "change-threshold", defaultChangeThreshold, "Number of observed values before a resource is reported.")
+	run.IntVarP(&options.changeThreshold, "generation-changes", "g", defaultChangeThreshold, "Deprecated alias for --change-threshold.")
+	_ = run.MarkDeprecated("generation-changes", "use --change-threshold instead")
+	run.Var(&options.signal, "signal", "Signal to observe: resource-version or generation.")
+	run.StringArrayVar(&options.includeFilters, "include-resource", nil, "Only watch this resource, repeatable. Format: group/version/resource, core/v1/pods, or /v1/pods.")
+	run.StringArrayVar(&options.excludeFilters, "exclude-resource", nil, "Exclude this resource, repeatable. Format: group/version/resource, core/v1/pods, or /v1/pods.")
 
 	rootCmd.Flags().AddFlagSet(run)
 
 	config := namedFlagSet.FlagSet("config")
 	configFlags.AddFlags(config)
-
 	rootCmd.Flags().AddFlagSet(config)
 
-	// group flogs by sections in usage
 	rootCmd.SetUsageFunc(func(cmd *cobra.Command) error {
 		fmt.Fprintf(cmd.OutOrStderr(), "Usage: %s\n", cmd.UseLine())
 		cliflag.PrintSections(cmd.OutOrStderr(), namedFlagSet, 80)
@@ -122,149 +118,82 @@ func init() {
 	})
 }
 
-func run(ctx context.Context, config *rest.Config) error {
-
+func run(ctx context.Context, config *rest.Config, opts runOptions) error {
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
-		return fmt.Errorf("Can't create discovery client: %v", err)
+		return fmt.Errorf("can't create discovery client: %w", err)
 	}
 
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
-		return fmt.Errorf("Can't create dynamic client: %v", err)
+		return fmt.Errorf("can't create dynamic client: %w", err)
 	}
-
-	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, time.Second*30)
 
 	_, apiResourceLists, err := discoveryClient.ServerGroupsAndResources()
 	if err != nil {
-		return fmt.Errorf("Can't get server resources: %v", err)
+		return fmt.Errorf("can't get server resources: %w", err)
 	}
 
-	var cancel context.CancelFunc
+	include, exclude, err := buildResourceMatcher(opts.includeFilters, opts.excludeFilters)
+	if err != nil {
+		return err
+	}
 
-	// context with timeout
-	if runDuration > 0 {
-		ctx, cancel = context.WithTimeout(ctx, runDuration)
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var cancel context.CancelFunc
+	if opts.runDuration > 0 {
+		ctx, cancel = context.WithTimeout(ctx, opts.runDuration)
 	} else {
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
 
-	// // Interception des signaux pour arrêter correctement
-	// sigChan := make(chan os.Signal, 1)
-	// signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	// go func() {
-	// 	<-sigChan
-	// 	log.Println("Signal reçu, arrêt des watchers...")
-	// 	cancel()
-	// }()
-
-	ignoreList := []string{
-		"Event",
-		// leases
-		"Lease",
-	}
+	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 30*time.Second)
+	tracker := NewChangeTracker(opts.signal, opts.changeThreshold, 5)
 
 	var wg sync.WaitGroup
-
-	// Démarrer les watchers
 	for _, apiResourceList := range apiResourceLists {
-
-		// Ignore list
-
-		// Ignore resources in ignoreList
-
 		gv, err := schema.ParseGroupVersion(apiResourceList.GroupVersion)
 		if err != nil {
-			logger.Warn("Can't parse group version", "GroupVersion", apiResourceList.GroupVersion)
+			logger.Warn("can't parse group version", "groupVersion", apiResourceList.GroupVersion)
 			continue
 		}
 
 		for _, resource := range apiResourceList.APIResources {
-
-			if slices.Contains(ignoreList, resource.Kind) {
-				logger.Debug("Ignoring resource", "resource", resource.Kind)
-				continue
-			}
-
-			// Ignore resources that don't support watch
-			if !slices.Contains(resource.Verbs, "watch") {
-				continue
-			}
-
-			// Ignore subresources
-			if strings.Contains(resource.Name, "/") {
-				continue
-			}
-
 			gvr := schema.GroupVersionResource{
 				Group:    gv.Group,
 				Version:  gv.Version,
 				Resource: resource.Name,
 			}
 
-			// Initialisation de la map historique
-			historiesMap[gvr] = make(map[string]*generationHistory)
+			if !shouldWatchResource(gvr, resource, include, exclude) {
+				continue
+			}
 
 			informer := factory.ForResource(gvr).Informer()
-
 			informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 				AddFunc: func(rawObj interface{}) {
-					obj, ok := rawObj.(*unstructured.Unstructured)
-					if !ok {
-						return
-					}
-
-					id := fmt.Sprintf("%s/%s", obj.GetNamespace(), obj.GetName())
-					version := obj.GetResourceVersion()
-					if version == "" {
-						return
-					}
-
-					resourceMap := historiesMap[gvr] // map[string]*generationHistory
-					if _, exists := resourceMap[id]; !exists {
-						resourceMap[id] = &generationHistory{
-							lastVersion: version,
-							count:       1,
-							lock:        &sync.Mutex{},
-						}
+					if obj, ok := rawObj.(*unstructured.Unstructured); ok {
+						tracker.ObserveAdd(gvr, obj)
 					}
 				},
 				UpdateFunc: func(oldObj, rawObj interface{}) {
-					obj, ok := rawObj.(*unstructured.Unstructured)
-					if !ok {
+					oldUnstructured, oldOK := oldObj.(*unstructured.Unstructured)
+					newUnstructured, newOK := rawObj.(*unstructured.Unstructured)
+					if !newOK {
 						return
 					}
-
-					id := fmt.Sprintf("%s/%s", obj.GetNamespace(), obj.GetName())
-					version := obj.GetResourceVersion()
-					if version == "" {
-						return
+					if !oldOK {
+						oldUnstructured = newUnstructured
 					}
-
-					resourceMap := historiesMap[gvr] // map[string]*generationHistory
-
-					genHist := resourceMap[id]
-
-					// Compare this version with the last one
-					if version != genHist.lastVersion {
-						genHist.lock.Lock()
-						defer genHist.lock.Unlock()
-						genHist.count++
-						genHist.lastVersion = version
-
-						if genHist.count > maxGenerationChanges {
-							if len(genHist.diffs) < 5 {
-								genHist.diffs = append(genHist.diffs, cmp.Diff(oldObj, rawObj, cmp.AllowUnexported(unstructured.Unstructured{})))
-							}
-						}
-					}
+					tracker.ObserveUpdate(gvr, oldUnstructured, newUnstructured)
 				},
 			})
 
 			informer.SetWatchErrorHandler(func(r *cache.Reflector, err error) {
-				logger.Error("Error in watch", "resource", gvr.Resource, "error", err)
+				logger.Error("error in watch", "resource", gvr.String(), "error", err)
 			})
 
 			wg.Add(1)
@@ -276,99 +205,104 @@ func run(ctx context.Context, config *rest.Config) error {
 	}
 
 	wg.Wait()
+	return DisplayDiffs(tracker.Snapshot())
+}
 
-	if len(historiesMap) > 0 {
-		if err := DisplayDiffs(historiesMap); err != nil {
-			return fmt.Errorf("Can't display diffs: %v", err)
-		}
+func validateOptions(opts runOptions) error {
+	if opts.changeThreshold < 1 {
+		return fmt.Errorf("--change-threshold must be greater than 0")
 	}
-
+	if !opts.signal.Valid() {
+		return fmt.Errorf("--signal must be one of: %s", strings.Join(validSignals(), ", "))
+	}
+	if _, _, err := buildResourceMatcher(opts.includeFilters, opts.excludeFilters); err != nil {
+		return err
+	}
 	return nil
 }
 
-func DisplayDiffs(historiesMap HistoriesMap) error {
+func shouldWatchResource(gvr schema.GroupVersionResource, resource v1.APIResource, include, exclude resourceMatcher) bool {
+	if strings.Contains(resource.Name, "/") {
+		return false
+	}
+	if !hasVerb(resource.Verbs, "list") || !hasVerb(resource.Verbs, "watch") {
+		return false
+	}
+	if exclude.Matches(gvr) {
+		return false
+	}
+	return include.Empty() || include.Matches(gvr)
+}
 
-	// Filter historiesMap only with diffs
-	filteredHistoriesMap := make(HistoriesMap)
-
-	for gvr, resourceMap := range historiesMap {
-		for id, genHist := range resourceMap {
-			if len(genHist.diffs) > 0 {
-				if _, exists := filteredHistoriesMap[gvr]; !exists {
-					filteredHistoriesMap[gvr] = make(map[string]*generationHistory)
-				}
-				filteredHistoriesMap[gvr][id] = genHist
-			}
+func hasVerb(verbs []string, want string) bool {
+	for _, verb := range verbs {
+		if verb == want {
+			return true
 		}
 	}
+	return false
+}
 
-	if len(filteredHistoriesMap) == 0 {
-		logger.Info("No diffs found")
+func DisplayDiffs(histories HistoriesMap) error {
+	filteredHistories := filterHistoriesWithDiffs(histories)
+	if len(filteredHistories) == 0 {
+		logger.Info("no diffs found")
 		return nil
 	}
 
 	app := tview.NewApplication()
+	root := tview.NewTreeNode("updated").SetColor(tcell.ColorRed).SetSelectable(false)
 
-	root := tview.NewTreeNode("updated").
-		SetColor(tcell.ColorRed).
-		SetSelectable(false)
-
-	for gvr, resourceMap := range filteredHistoriesMap {
-
-		node := tview.NewTreeNode(gvr.String()).
-			SetColor(tcell.ColorYellow).
-			SetSelectable(false)
-
+	for _, gvr := range sortedGVRs(filteredHistories) {
+		resourceMap := filteredHistories[gvr]
+		node := tview.NewTreeNode(gvr.String()).SetColor(tcell.ColorYellow).SetSelectable(false)
 		root.AddChild(node)
 
-		for id, genHist := range resourceMap {
-
-			resource := tview.NewTreeNode(id).Collapse()
-
+		for _, id := range sortedIDs(resourceMap) {
+			history := resourceMap[id]
+			resource := tview.NewTreeNode(fmt.Sprintf("%s (%d changes)", id, history.Count)).Collapse()
 			node.AddChild(resource)
 
-			for i, diff := range genHist.diffs {
-				resource.AddChild(tview.NewTreeNode(strconv.Itoa(i)).
+			for i, diff := range history.Diffs {
+				resource.AddChild(tview.NewTreeNode(fmt.Sprintf("diff %d", i+1)).
 					SetReference(diff).
 					SetSelectable(true))
 			}
 		}
 	}
 
-	tree := tview.NewTreeView().
-		SetRoot(root).
-		SetCurrentNode(root)
-
-	diffView := tview.NewTextView()
-
+	tree := tview.NewTreeView().SetRoot(root).SetCurrentNode(root)
+	diffView := tview.NewTextView().SetDynamicColors(true).SetScrollable(true)
 	diffView.SetBorder(true).SetTitle("Diff")
 
 	tree.SetSelectedFunc(func(node *tview.TreeNode) {
-		// manage expand/collapse
 		if len(node.GetChildren()) == 0 {
-			diff := node.GetReference()
-			if diff == nil {
-				return
+			if diff, ok := node.GetReference().(string); ok {
+				diffView.SetText(diff)
 			}
-			diffView.SetText(diff.(string))
-
 			return
 		}
-
 		node.SetExpanded(!node.IsExpanded())
 	})
 
 	footer := tview.NewTextView().
-		SetText("Press TAB to switch between tree and diff view.")
+		SetText("TAB: switch focus | ENTER: expand/select | q/Esc: quit")
 
-	// Tab navigation
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyTab {
+		switch event.Key() {
+		case tcell.KeyTab:
 			if app.GetFocus() == tree {
 				app.SetFocus(diffView)
 			} else {
 				app.SetFocus(tree)
 			}
+			return nil
+		case tcell.KeyEsc:
+			app.Stop()
+			return nil
+		}
+		if event.Rune() == 'q' {
+			app.Stop()
 			return nil
 		}
 		return event
@@ -386,8 +320,43 @@ func DisplayDiffs(historiesMap HistoriesMap) error {
 		AddItem(footer, 1, 1, false)
 
 	if err := app.SetRoot(flex, true).SetFocus(tree).Run(); err != nil {
-		return fmt.Errorf("Can't run tview: %v", err)
+		return fmt.Errorf("can't run tview: %w", err)
 	}
-
 	return nil
+}
+
+func filterHistoriesWithDiffs(histories HistoriesMap) HistoriesMap {
+	filtered := make(HistoriesMap)
+	for gvr, resourceMap := range histories {
+		for id, history := range resourceMap {
+			if len(history.Diffs) == 0 {
+				continue
+			}
+			if _, exists := filtered[gvr]; !exists {
+				filtered[gvr] = make(map[string]ResourceHistory)
+			}
+			filtered[gvr][id] = history
+		}
+	}
+	return filtered
+}
+
+func sortedGVRs(histories HistoriesMap) []schema.GroupVersionResource {
+	gvrs := make([]schema.GroupVersionResource, 0, len(histories))
+	for gvr := range histories {
+		gvrs = append(gvrs, gvr)
+	}
+	sort.Slice(gvrs, func(i, j int) bool {
+		return gvrs[i].String() < gvrs[j].String()
+	})
+	return gvrs
+}
+
+func sortedIDs(histories map[string]ResourceHistory) []string {
+	ids := make([]string, 0, len(histories))
+	for id := range histories {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }

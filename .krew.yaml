@@ -24,8 +24,15 @@ spec:
         arch: amd64
     {{addURIAndSha "https://github.com/guilhem/kubectl-storm/releases/download/{{ .TagName }}/kubectl-storm_{{ .TagName }}_linux_amd64.tar.gz" .TagName }}
     bin: kubectl-storm
-  shortDescription: Monitor and diff excessive generation changes.
+  - selector:
+      matchLabels:
+        os: linux
+        arch: arm64
+    {{addURIAndSha "https://github.com/guilhem/kubectl-storm/releases/download/{{ .TagName }}/kubectl-storm_{{ .TagName }}_linux_arm64.tar.gz" .TagName }}
+    bin: kubectl-storm
+  shortDescription: Monitor and diff excessive Kubernetes resource changes.
   description: |
-    Monitor and diff excessive generation changes.
-    It detects rapid updates to Kubernetes resource generations, providing detailed diffs and a visual interface for debugging.
-    The tool supports filtering by resource types and employs a user-friendly terminal interface to display updates and differences, making it easier to identify and address potential issues caused by high-frequency changes in resource configurations.
+    Monitor and diff excessive Kubernetes resource changes.
+    By default it detects rapid metadata.resourceVersion updates, including status and metadata write storms.
+    It can also monitor metadata.generation changes to focus on spec updates.
+    The tool supports resource include/exclude filters and uses a terminal interface to display affected resources, change counts, and cleaned diffs.
