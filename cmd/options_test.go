@@ -32,6 +32,19 @@ func TestValidateOptionsRejectsInvalidThreshold(t *testing.T) {
 	}
 }
 
+func TestValidateOptionsRejectsInvalidKubeAPIOverrides(t *testing.T) {
+	tests := []runOptions{
+		{changeThreshold: 1, signal: signalResourceVersion, kubeAPIQPS: -1},
+		{changeThreshold: 1, signal: signalResourceVersion, kubeAPIBurst: -1},
+	}
+
+	for _, opts := range tests {
+		if err := validateOptions(opts); err == nil {
+			t.Fatalf("validateOptions(%#v) should fail", opts)
+		}
+	}
+}
+
 func TestRootCommandFlags(t *testing.T) {
 	flags := rootCmd.Flags()
 
@@ -46,6 +59,12 @@ func TestRootCommandFlags(t *testing.T) {
 	}
 	if flags.Lookup("exclude-resource") == nil {
 		t.Fatal("missing --exclude-resource flag")
+	}
+	if flags.Lookup("kube-api-qps") == nil {
+		t.Fatal("missing --kube-api-qps flag")
+	}
+	if flags.Lookup("kube-api-burst") == nil {
+		t.Fatal("missing --kube-api-burst flag")
 	}
 
 	deprecated := flags.Lookup("generation-changes")

@@ -17,13 +17,13 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -54,6 +54,8 @@ type runOptions struct {
 	signal          changeSignal
 	includeFilters  []string
 	excludeFilters  []string
+	kubeAPIQPS      float32
+	kubeAPIBurst    int
 }
 
 var options = runOptions{
@@ -104,6 +106,8 @@ func init() {
 	run.Var(&options.signal, "signal", "Signal to observe: resource-version or generation.")
 	run.StringArrayVar(&options.includeFilters, "include-resource", nil, "Only watch this resource, repeatable. Format: group/version/resource, core/v1/pods, or /v1/pods.")
 	run.StringArrayVar(&options.excludeFilters, "exclude-resource", nil, "Exclude this resource, repeatable. Format: group/version/resource, core/v1/pods, or /v1/pods.")
+	run.Float32Var(&options.kubeAPIQPS, "kube-api-qps", 0, "Override Kubernetes API client QPS. Use 0 to keep the kubeconfig/client-go default.")
+	run.IntVar(&options.kubeAPIBurst, "kube-api-burst", 0, "Override Kubernetes API client burst. Use 0 to keep the kubeconfig/client-go default.")
 
 	rootCmd.Flags().AddFlagSet(run)
 
@@ -119,6 +123,13 @@ func init() {
 }
 
 func run(ctx context.Context, config *rest.Config, opts runOptions) error {
+	include, exclude, err := buildResourceMatcher(opts.includeFilters, opts.excludeFilters)
+	if err != nil {
+		return err
+	}
+
+	config = configWithKubeAPIOverrides(config, opts)
+
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
 		return fmt.Errorf("can't create discovery client: %w", err)
@@ -129,32 +140,171 @@ func run(ctx context.Context, config *rest.Config, opts runOptions) error {
 		return fmt.Errorf("can't create dynamic client: %w", err)
 	}
 
-	_, apiResourceLists, err := discoveryClient.ServerGroupsAndResources()
+	apiResourceLists, err := discoverAPIResources(discoveryClient, include)
 	if err != nil {
 		return fmt.Errorf("can't get server resources: %w", err)
-	}
-
-	include, exclude, err := buildResourceMatcher(opts.includeFilters, opts.excludeFilters)
-	if err != nil {
-		return err
 	}
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var cancel context.CancelFunc
-	if opts.runDuration > 0 {
-		ctx, cancel = context.WithTimeout(ctx, opts.runDuration)
-	} else {
-		ctx, cancel = context.WithCancel(ctx)
-	}
-	defer cancel()
-
-	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 30*time.Second)
+	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 0)
 	tracker := NewChangeTracker(opts.signal, opts.changeThreshold, 5)
+	watchResources := selectWatchResources(apiResourceLists, include, exclude)
 
-	var wg sync.WaitGroup
+	noResync := time.Duration(0)
+	handlerSyncs := make([]cache.InformerSynced, 0, len(watchResources))
+	for _, watchResource := range watchResources {
+		gvr := watchResource.GVR
+		informer := factory.ForResource(gvr).Informer()
+		if err := informer.SetTransform(stripManagedFieldsTransform); err != nil {
+			return fmt.Errorf("can't set transform for %s: %w", gvr.String(), err)
+		}
+		registration, err := informer.AddEventHandlerWithOptions(cache.ResourceEventHandlerDetailedFuncs{
+			AddFunc: func(rawObj interface{}, _ bool) {
+				if obj, ok := unstructuredFromObject(rawObj); ok {
+					tracker.ObserveAdd(gvr, obj)
+				}
+			},
+			UpdateFunc: func(oldObj, rawObj interface{}) {
+				oldUnstructured, oldOK := oldObj.(*unstructured.Unstructured)
+				newUnstructured, newOK := rawObj.(*unstructured.Unstructured)
+				if !newOK {
+					return
+				}
+				if !oldOK {
+					oldUnstructured = newUnstructured
+				}
+				tracker.ObserveUpdate(gvr, oldUnstructured, newUnstructured)
+			},
+			DeleteFunc: func(rawObj interface{}) {
+				if obj, ok := unstructuredFromObject(rawObj); ok {
+					tracker.ObserveDelete(gvr, obj)
+				}
+			},
+		}, cache.HandlerOptions{ResyncPeriod: &noResync})
+		if err != nil {
+			return fmt.Errorf("can't add event handler for %s: %w", gvr.String(), err)
+		}
+		handlerSyncs = append(handlerSyncs, registration.HasSynced)
+
+		if err := informer.SetWatchErrorHandler(func(r *cache.Reflector, err error) {
+			logger.Error("error in watch", "resource", gvr.String(), "error", err)
+		}); err != nil {
+			return fmt.Errorf("can't set watch error handler for %s: %w", gvr.String(), err)
+		}
+	}
+
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	defer func() {
+		cancelWatch()
+		factory.Shutdown()
+	}()
+
+	factory.Start(watchCtx.Done())
+	if !waitForInformerSync(watchCtx, factory, handlerSyncs) {
+		return DisplayDiffs(tracker.Snapshot())
+	}
+
+	waitForRunDuration(ctx, opts.runDuration)
+	return DisplayDiffs(tracker.Snapshot())
+}
+
+func validateOptions(opts runOptions) error {
+	if opts.changeThreshold < 1 {
+		return fmt.Errorf("--change-threshold must be greater than 0")
+	}
+	if !opts.signal.Valid() {
+		return fmt.Errorf("--signal must be one of: %s", strings.Join(validSignals(), ", "))
+	}
+	if opts.kubeAPIQPS < 0 {
+		return fmt.Errorf("--kube-api-qps must be greater than or equal to 0")
+	}
+	if opts.kubeAPIBurst < 0 {
+		return fmt.Errorf("--kube-api-burst must be greater than or equal to 0")
+	}
+	if _, _, err := buildResourceMatcher(opts.includeFilters, opts.excludeFilters); err != nil {
+		return err
+	}
+	return nil
+}
+
+func configWithKubeAPIOverrides(config *rest.Config, opts runOptions) *rest.Config {
+	copied := rest.CopyConfig(config)
+	if opts.kubeAPIQPS > 0 {
+		copied.QPS = opts.kubeAPIQPS
+	}
+	if opts.kubeAPIBurst > 0 {
+		copied.Burst = opts.kubeAPIBurst
+	}
+	return copied
+}
+
+type resourceDiscoveryClient interface {
+	ServerResourcesForGroupVersion(groupVersion string) (*v1.APIResourceList, error)
+	ServerGroupsAndResources() ([]*v1.APIGroup, []*v1.APIResourceList, error)
+}
+
+func discoverAPIResources(discoveryClient resourceDiscoveryClient, include resourceMatcher) ([]*v1.APIResourceList, error) {
+	if include.Empty() {
+		_, apiResourceLists, err := discoveryClient.ServerGroupsAndResources()
+		if err == nil {
+			return apiResourceLists, nil
+		}
+		if len(apiResourceLists) > 0 && discovery.IsGroupDiscoveryFailedError(err) {
+			logger.Warn("partial server resource discovery", "error", err)
+			return apiResourceLists, nil
+		}
+		return nil, err
+	}
+
+	groupVersions := sortedIncludedGroupVersions(include)
+	apiResourceLists := make([]*v1.APIResourceList, 0, len(groupVersions))
+	errs := make([]error, 0)
+	for _, groupVersion := range groupVersions {
+		apiResourceList, err := discoveryClient.ServerResourcesForGroupVersion(groupVersion)
+		if err != nil {
+			logger.Warn("can't get server resources for group version", "groupVersion", groupVersion, "error", err)
+			errs = append(errs, fmt.Errorf("%s: %w", groupVersion, err))
+			continue
+		}
+		if apiResourceList == nil {
+			continue
+		}
+		apiResourceLists = append(apiResourceLists, apiResourceList)
+	}
+
+	if len(apiResourceLists) == 0 && len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	return apiResourceLists, nil
+}
+
+func sortedIncludedGroupVersions(include resourceMatcher) []string {
+	groupVersions := make(map[string]struct{})
+	for gvr := range include {
+		groupVersions[gvr.GroupVersion().String()] = struct{}{}
+	}
+
+	sorted := make([]string, 0, len(groupVersions))
+	for groupVersion := range groupVersions {
+		sorted = append(sorted, groupVersion)
+	}
+	sort.Strings(sorted)
+	return sorted
+}
+
+type watchResource struct {
+	GVR         schema.GroupVersionResource
+	APIResource v1.APIResource
+}
+
+func selectWatchResources(apiResourceLists []*v1.APIResourceList, include, exclude resourceMatcher) []watchResource {
+	watchResources := make([]watchResource, 0)
 	for _, apiResourceList := range apiResourceLists {
+		if apiResourceList == nil {
+			continue
+		}
 		gv, err := schema.ParseGroupVersion(apiResourceList.GroupVersion)
 		if err != nil {
 			logger.Warn("can't parse group version", "groupVersion", apiResourceList.GroupVersion)
@@ -167,58 +317,19 @@ func run(ctx context.Context, config *rest.Config, opts runOptions) error {
 				Version:  gv.Version,
 				Resource: resource.Name,
 			}
-
-			if !shouldWatchResource(gvr, resource, include, exclude) {
-				continue
+			if shouldWatchResource(gvr, resource, include, exclude) {
+				watchResources = append(watchResources, watchResource{
+					GVR:         gvr,
+					APIResource: resource,
+				})
 			}
-
-			informer := factory.ForResource(gvr).Informer()
-			informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-				AddFunc: func(rawObj interface{}) {
-					if obj, ok := rawObj.(*unstructured.Unstructured); ok {
-						tracker.ObserveAdd(gvr, obj)
-					}
-				},
-				UpdateFunc: func(oldObj, rawObj interface{}) {
-					oldUnstructured, oldOK := oldObj.(*unstructured.Unstructured)
-					newUnstructured, newOK := rawObj.(*unstructured.Unstructured)
-					if !newOK {
-						return
-					}
-					if !oldOK {
-						oldUnstructured = newUnstructured
-					}
-					tracker.ObserveUpdate(gvr, oldUnstructured, newUnstructured)
-				},
-			})
-
-			informer.SetWatchErrorHandler(func(r *cache.Reflector, err error) {
-				logger.Error("error in watch", "resource", gvr.String(), "error", err)
-			})
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				informer.Run(ctx.Done())
-			}()
 		}
 	}
 
-	wg.Wait()
-	return DisplayDiffs(tracker.Snapshot())
-}
-
-func validateOptions(opts runOptions) error {
-	if opts.changeThreshold < 1 {
-		return fmt.Errorf("--change-threshold must be greater than 0")
-	}
-	if !opts.signal.Valid() {
-		return fmt.Errorf("--signal must be one of: %s", strings.Join(validSignals(), ", "))
-	}
-	if _, _, err := buildResourceMatcher(opts.includeFilters, opts.excludeFilters); err != nil {
-		return err
-	}
-	return nil
+	sort.Slice(watchResources, func(i, j int) bool {
+		return watchResources[i].GVR.String() < watchResources[j].GVR.String()
+	})
+	return watchResources
 }
 
 func shouldWatchResource(gvr schema.GroupVersionResource, resource v1.APIResource, include, exclude resourceMatcher) bool {
@@ -243,6 +354,62 @@ func hasVerb(verbs []string, want string) bool {
 	return false
 }
 
+func stripManagedFieldsTransform(rawObj interface{}) (interface{}, error) {
+	obj, ok := rawObj.(*unstructured.Unstructured)
+	if !ok {
+		return rawObj, nil
+	}
+
+	copied := obj.DeepCopy()
+	unstructured.RemoveNestedField(copied.Object, "metadata", "managedFields")
+	return copied, nil
+}
+
+func unstructuredFromObject(rawObj interface{}) (*unstructured.Unstructured, bool) {
+	switch obj := rawObj.(type) {
+	case *unstructured.Unstructured:
+		return obj, true
+	case cache.DeletedFinalStateUnknown:
+		return unstructuredFromObject(obj.Obj)
+	case *cache.DeletedFinalStateUnknown:
+		return unstructuredFromObject(obj.Obj)
+	default:
+		return nil, false
+	}
+}
+
+func waitForInformerSync(ctx context.Context, factory dynamicinformer.DynamicSharedInformerFactory, handlerSyncs []cache.InformerSynced) bool {
+	for gvr, synced := range factory.WaitForCacheSync(ctx.Done()) {
+		if !synced {
+			logger.Warn("informer cache did not sync", "resource", gvr.String())
+			return false
+		}
+	}
+	if len(handlerSyncs) == 0 {
+		return true
+	}
+	if !cache.WaitForCacheSync(ctx.Done(), handlerSyncs...) {
+		logger.Warn("informer handlers did not sync")
+		return false
+	}
+	return true
+}
+
+func waitForRunDuration(ctx context.Context, runDuration time.Duration) {
+	if runDuration <= 0 {
+		<-ctx.Done()
+		return
+	}
+
+	timer := time.NewTimer(runDuration)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
 func DisplayDiffs(histories HistoriesMap) error {
 	filteredHistories := filterHistoriesWithDiffs(histories)
 	if len(filteredHistories) == 0 {
@@ -260,7 +427,7 @@ func DisplayDiffs(histories HistoriesMap) error {
 
 		for _, id := range sortedIDs(resourceMap) {
 			history := resourceMap[id]
-			resource := tview.NewTreeNode(fmt.Sprintf("%s (%d changes)", id, history.Count)).Collapse()
+			resource := tview.NewTreeNode(fmt.Sprintf("%s (%d changes)", historyLabel(id, history), history.Count)).Collapse()
 			node.AddChild(resource)
 
 			for i, diff := range history.Diffs {
@@ -357,6 +524,24 @@ func sortedIDs(histories map[string]ResourceHistory) []string {
 	for id := range histories {
 		ids = append(ids, id)
 	}
-	sort.Strings(ids)
+	sort.Slice(ids, func(i, j int) bool {
+		left := historyLabel(ids[i], histories[ids[i]])
+		right := historyLabel(ids[j], histories[ids[j]])
+		if left == right {
+			return ids[i] < ids[j]
+		}
+		return left < right
+	})
 	return ids
+}
+
+func historyLabel(key string, history ResourceHistory) string {
+	id := history.ID
+	if id == "" {
+		id = key
+	}
+	if history.Deleted {
+		return id + " [deleted]"
+	}
+	return id
 }

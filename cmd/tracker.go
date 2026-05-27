@@ -10,9 +10,12 @@ import (
 )
 
 type ResourceHistory struct {
+	ID        string
+	UID       string
 	LastValue string
 	Count     int
 	Diffs     []string
+	Deleted   bool
 }
 
 type HistoriesMap map[schema.GroupVersionResource]map[string]ResourceHistory
@@ -48,18 +51,30 @@ func (t *ChangeTracker) ObserveAdd(gvr schema.GroupVersionResource, obj *unstruc
 	defer t.lock.Unlock()
 
 	resourceMap := t.resourceMap(gvr)
-	id := resourceID(obj)
-	if _, exists := resourceMap[id]; exists {
+	key := resourceKey(obj)
+	history, exists := resourceMap[key]
+	if exists {
+		history.ID = resourceID(obj)
+		history.UID = resourceUID(obj)
+		history.LastValue = value
+		history.Deleted = false
+		if history.Count == 0 {
+			history.Count = 1
+		}
+		resourceMap[key] = history
 		return
 	}
-	resourceMap[id] = ResourceHistory{
-		LastValue: value,
-		Count:     1,
-	}
+	resourceMap[key] = newResourceHistory(obj, value, 1)
 }
 
 func (t *ChangeTracker) ObserveUpdate(gvr schema.GroupVersionResource, oldObj, newObj *unstructured.Unstructured) {
 	if newObj == nil {
+		return
+	}
+
+	if isReplacementUpdate(oldObj, newObj) {
+		t.ObserveDelete(gvr, oldObj)
+		t.ObserveAdd(gvr, newObj)
 		return
 	}
 
@@ -68,42 +83,76 @@ func (t *ChangeTracker) ObserveUpdate(gvr schema.GroupVersionResource, oldObj, n
 		return
 	}
 
-	id := resourceID(newObj)
+	key := resourceKey(newObj)
 
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
 	resourceMap := t.resourceMap(gvr)
-	history, exists := resourceMap[id]
+	history, exists := resourceMap[key]
 	if !exists {
 		if oldObj != nil {
 			if oldValue, ok := t.signalValue(oldObj); ok {
-				history = ResourceHistory{
-					LastValue: oldValue,
-					Count:     1,
-				}
+				history = newResourceHistory(newObj, oldValue, 1)
 			}
 		}
 		if history.Count == 0 {
-			resourceMap[id] = ResourceHistory{
-				LastValue: newValue,
-				Count:     1,
-			}
+			resourceMap[key] = newResourceHistory(newObj, newValue, 1)
 			return
 		}
 	}
 
 	if history.LastValue == newValue {
-		resourceMap[id] = history
+		history.ID = resourceID(newObj)
+		history.UID = resourceUID(newObj)
+		history.Deleted = false
+		resourceMap[key] = history
 		return
 	}
 
 	history.Count++
 	history.LastValue = newValue
+	history.ID = resourceID(newObj)
+	history.UID = resourceUID(newObj)
+	history.Deleted = false
 	if history.Count > t.threshold && len(history.Diffs) < t.maxDiffs {
 		history.Diffs = append(history.Diffs, diffObjects(t.signal, oldObj, newObj))
 	}
-	resourceMap[id] = history
+	resourceMap[key] = history
+}
+
+func (t *ChangeTracker) ObserveDelete(gvr schema.GroupVersionResource, obj *unstructured.Unstructured) {
+	if obj == nil {
+		return
+	}
+
+	key := resourceKey(obj)
+
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	resourceMap, exists := t.histories[gvr]
+	if !exists {
+		return
+	}
+
+	history, exists := resourceMap[key]
+	if !exists {
+		return
+	}
+
+	if len(history.Diffs) == 0 {
+		delete(resourceMap, key)
+		if len(resourceMap) == 0 {
+			delete(t.histories, gvr)
+		}
+		return
+	}
+
+	history.ID = resourceID(obj)
+	history.UID = resourceUID(obj)
+	history.Deleted = true
+	resourceMap[key] = history
 }
 
 func (t *ChangeTracker) Snapshot() HistoriesMap {
@@ -132,6 +181,15 @@ func (t *ChangeTracker) resourceMap(gvr schema.GroupVersionResource) map[string]
 	return resourceMap
 }
 
+func newResourceHistory(obj *unstructured.Unstructured, value string, count int) ResourceHistory {
+	return ResourceHistory{
+		ID:        resourceID(obj),
+		UID:       resourceUID(obj),
+		LastValue: value,
+		Count:     count,
+	}
+}
+
 func (t *ChangeTracker) signalValue(obj *unstructured.Unstructured) (string, bool) {
 	switch t.signal {
 	case signalGeneration:
@@ -149,6 +207,28 @@ func resourceID(obj *unstructured.Unstructured) string {
 		return obj.GetName()
 	}
 	return fmt.Sprintf("%s/%s", obj.GetNamespace(), obj.GetName())
+}
+
+func resourceUID(obj *unstructured.Unstructured) string {
+	return string(obj.GetUID())
+}
+
+func resourceKey(obj *unstructured.Unstructured) string {
+	id := resourceID(obj)
+	uid := resourceUID(obj)
+	if uid == "" {
+		return id
+	}
+	return fmt.Sprintf("%s#%s", id, uid)
+}
+
+func isReplacementUpdate(oldObj, newObj *unstructured.Unstructured) bool {
+	if oldObj == nil || newObj == nil {
+		return false
+	}
+	oldUID := resourceUID(oldObj)
+	newUID := resourceUID(newObj)
+	return oldUID != "" && newUID != "" && oldUID != newUID
 }
 
 func diffObjects(signal changeSignal, oldObj, newObj *unstructured.Unstructured) string {
