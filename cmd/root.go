@@ -194,15 +194,6 @@ func run(ctx context.Context, config *rest.Config, opts runOptions) error {
 	}
 	watchResources := selectWatchResources(apiResourceLists, include, exclude)
 
-	handlerSyncs := make([]cache.InformerSynced, 0, len(watchResources))
-	for _, watchResource := range watchResources {
-		handlerSync, err := registerWatchResourceHandler(ctx, factory, watchResource.GVR, tracker, diffRecorder)
-		if err != nil {
-			return err
-		}
-		handlerSyncs = append(handlerSyncs, handlerSync)
-	}
-
 	watchCtx, cancelWatch := context.WithCancel(ctx)
 	var stopWatchesOnce sync.Once
 	stopWatches := func() {
@@ -212,6 +203,15 @@ func run(ctx context.Context, config *rest.Config, opts runOptions) error {
 		})
 	}
 	defer stopWatches()
+
+	handlerSyncs := make([]cache.InformerSynced, 0, len(watchResources))
+	for _, watchResource := range watchResources {
+		handlerSync, err := registerWatchResourceHandler(watchCtx, factory, watchResource.GVR, tracker, diffRecorder)
+		if err != nil {
+			return err
+		}
+		handlerSyncs = append(handlerSyncs, handlerSync)
+	}
 
 	factory.Start(watchCtx.Done())
 	if !waitForInformerSync(watchCtx, factory, handlerSyncs) {
