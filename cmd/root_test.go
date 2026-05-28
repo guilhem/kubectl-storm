@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -91,6 +92,20 @@ func TestNamespaceForWatch(t *testing.T) {
 	}
 	if got := namespaceForWatch(runOptions{namespaceScope: "prod"}); got != "prod" {
 		t.Fatalf("namespaceForWatch(prod) = %q, want prod", got)
+	}
+}
+
+func TestContextWithRunDurationExpires(t *testing.T) {
+	ctx, cancel := contextWithRunDuration(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("context should expire when run duration elapses")
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("context error = %v, want deadline exceeded", ctx.Err())
 	}
 }
 
@@ -182,12 +197,32 @@ func TestSelectWatchResourcesFiltersAndSorts(t *testing.T) {
 		},
 	}
 
-	got := selectWatchResources(apiResourceLists, include, exclude)
+	got := selectWatchResources(apiResourceLists, include, exclude, runOptions{})
 	if len(got) != 1 {
 		t.Fatalf("watch resource count = %d, want 1", len(got))
 	}
 	if got[0].GVR != deploymentGVR {
 		t.Fatalf("watch resource = %#v, want %#v", got[0].GVR, deploymentGVR)
+	}
+}
+
+func TestSelectWatchResourcesSkipsClusterScopedWithNamespaceScope(t *testing.T) {
+	apiResourceLists := []*v1.APIResourceList{
+		{
+			GroupVersion: "v1",
+			APIResources: []v1.APIResource{
+				{Name: "namespaces", Namespaced: false, Verbs: []string{"list", "watch"}},
+				{Name: "pods", Namespaced: true, Verbs: []string{"list", "watch"}},
+			},
+		},
+	}
+
+	got := selectWatchResources(apiResourceLists, resourceMatcher{}, resourceMatcher{}, runOptions{namespaceScope: "default"})
+	if len(got) != 1 {
+		t.Fatalf("watch resource count = %d, want 1", len(got))
+	}
+	if got[0].GVR.Resource != "pods" {
+		t.Fatalf("watched resource = %q, want pods", got[0].GVR.Resource)
 	}
 }
 

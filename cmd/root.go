@@ -181,6 +181,8 @@ func run(ctx context.Context, config *rest.Config, opts runOptions) error {
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	runCtx, cancelRun := contextWithRunDuration(ctx, opts.runDuration)
+	defer cancelRun()
 
 	factory, err := newResourceInformerFactory(config, dynamicClient, opts)
 	if err != nil {
@@ -192,9 +194,9 @@ func run(ctx context.Context, config *rest.Config, opts runOptions) error {
 	if normalizedWatchMode(opts.watchMode) != watchModeMetadata {
 		diffRecorder = nil
 	}
-	watchResources := selectWatchResources(apiResourceLists, include, exclude)
+	watchResources := selectWatchResources(apiResourceLists, include, exclude, opts)
 
-	watchCtx, cancelWatch := context.WithCancel(ctx)
+	watchCtx, cancelWatch := context.WithCancel(runCtx)
 	var stopWatchesOnce sync.Once
 	stopWatches := func() {
 		stopWatchesOnce.Do(func() {
@@ -219,7 +221,7 @@ func run(ctx context.Context, config *rest.Config, opts runOptions) error {
 		return DisplayDiffs(tracker.Snapshot())
 	}
 
-	waitForRunDuration(ctx, opts.runDuration)
+	waitForRunDuration(runCtx)
 	stopWatches()
 	return DisplayDiffs(tracker.Snapshot())
 }
@@ -338,6 +340,13 @@ func namespaceForWatch(opts runOptions) string {
 		return opts.namespaceScope
 	}
 	return v1.NamespaceAll
+}
+
+func contextWithRunDuration(ctx context.Context, runDuration time.Duration) (context.Context, context.CancelFunc) {
+	if runDuration > 0 {
+		return context.WithTimeout(ctx, runDuration)
+	}
+	return context.WithCancel(ctx)
 }
 
 func listOptionsTweak(opts runOptions) func(*v1.ListOptions) {
@@ -524,7 +533,7 @@ type watchResource struct {
 	APIResource v1.APIResource
 }
 
-func selectWatchResources(apiResourceLists []*v1.APIResourceList, include, exclude resourceMatcher) []watchResource {
+func selectWatchResources(apiResourceLists []*v1.APIResourceList, include, exclude resourceMatcher, opts runOptions) []watchResource {
 	watchResources := make([]watchResource, 0)
 	for _, apiResourceList := range apiResourceLists {
 		if apiResourceList == nil {
@@ -537,6 +546,9 @@ func selectWatchResources(apiResourceLists []*v1.APIResourceList, include, exclu
 		}
 
 		for _, resource := range apiResourceList.APIResources {
+			if opts.namespaceScope != "" && !resource.Namespaced {
+				continue
+			}
 			gvr := gv.WithResource(resource.Name)
 			if shouldWatchResource(gvr, resource, include, exclude) {
 				watchResources = append(watchResources, watchResource{
@@ -744,19 +756,8 @@ func waitForInformerSync(ctx context.Context, factory resourceInformerFactory, h
 	return true
 }
 
-func waitForRunDuration(ctx context.Context, runDuration time.Duration) {
-	if runDuration <= 0 {
-		<-ctx.Done()
-		return
-	}
-
-	timer := time.NewTimer(runDuration)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-	case <-timer.C:
-	}
+func waitForRunDuration(ctx context.Context) {
+	<-ctx.Done()
 }
 
 func DisplayDiffs(histories HistoriesMap) error {
