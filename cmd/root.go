@@ -403,24 +403,26 @@ func (f *scopeAwareResourceInformerFactory) isNamespacedResource(gvr schema.Grou
 		return namespaced
 	}
 
-	namespaced = false
 	resourceList, err := f.discoveryClient.ServerResourcesForGroupVersion(gvr.GroupVersion().String())
 	if err != nil {
-		klog.Warningf("failed to discover scope for %s: %v; defaulting to cluster scope", gvr.String(), err)
-	} else {
-		for _, resource := range resourceList.APIResources {
-			if resource.Name == gvr.Resource {
-				namespaced = resource.Namespaced
-				break
-			}
+		klog.Warningf("failed to discover scope for %s: %v; treating as namespaced to avoid widening to cluster scope", gvr.String(), err)
+		return true
+	}
+
+	for _, resource := range resourceList.APIResources {
+		if resource.Name == gvr.Resource {
+			namespaced = resource.Namespaced
+
+			f.mu.Lock()
+			f.namespacedByGVR[gvr] = namespaced
+			f.mu.Unlock()
+
+			return namespaced
 		}
 	}
 
-	f.mu.Lock()
-	f.namespacedByGVR[gvr] = namespaced
-	f.mu.Unlock()
-
-	return namespaced
+	klog.Warningf("failed to determine scope for %s from discovery results; treating as namespaced to avoid widening to cluster scope", gvr.String())
+	return true
 }
 
 func newResourceInformerFactory(config *rest.Config, dynamicClient dynamic.Interface, opts runOptions) (resourceInformerFactory, error) {
