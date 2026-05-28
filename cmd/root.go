@@ -361,22 +361,112 @@ type resourceInformerFactory interface {
 	Shutdown()
 }
 
+type scopeAwareResourceInformerFactory struct {
+	namespacedFactory resourceInformerFactory
+	clusterFactory    resourceInformerFactory
+	discoveryClient   resourceDiscoveryClient
+
+	mu              sync.RWMutex
+	namespacedByGVR map[schema.GroupVersionResource]bool
+}
+
+func (f *scopeAwareResourceInformerFactory) ForResource(gvr schema.GroupVersionResource) informers.GenericInformer {
+	if f.isNamespacedResource(gvr) {
+		return f.namespacedFactory.ForResource(gvr)
+	}
+	return f.clusterFactory.ForResource(gvr)
+}
+
+func (f *scopeAwareResourceInformerFactory) Start(stopCh <-chan struct{}) {
+	f.namespacedFactory.Start(stopCh)
+	f.clusterFactory.Start(stopCh)
+}
+
+func (f *scopeAwareResourceInformerFactory) WaitForCacheSync(stopCh <-chan struct{}) map[schema.GroupVersionResource]bool {
+	result := f.clusterFactory.WaitForCacheSync(stopCh)
+	for gvr, synced := range f.namespacedFactory.WaitForCacheSync(stopCh) {
+		result[gvr] = synced
+	}
+	return result
+}
+
+func (f *scopeAwareResourceInformerFactory) Shutdown() {
+	f.namespacedFactory.Shutdown()
+	f.clusterFactory.Shutdown()
+}
+
+func (f *scopeAwareResourceInformerFactory) isNamespacedResource(gvr schema.GroupVersionResource) bool {
+	f.mu.RLock()
+	namespaced, ok := f.namespacedByGVR[gvr]
+	f.mu.RUnlock()
+	if ok {
+		return namespaced
+	}
+
+	namespaced = false
+	resourceList, err := f.discoveryClient.ServerResourcesForGroupVersion(gvr.GroupVersion().String())
+	if err != nil {
+		klog.Warningf("failed to discover scope for %s: %v; defaulting to cluster scope", gvr.String(), err)
+	} else {
+		for _, resource := range resourceList.APIResources {
+			if resource.Name == gvr.Resource {
+				namespaced = resource.Namespaced
+				break
+			}
+		}
+	}
+
+	f.mu.Lock()
+	f.namespacedByGVR[gvr] = namespaced
+	f.mu.Unlock()
+
+	return namespaced
+}
+
 func newResourceInformerFactory(config *rest.Config, dynamicClient dynamic.Interface, opts runOptions) (resourceInformerFactory, error) {
 	namespace := namespaceForWatch(opts)
 	tweakListOptions := listOptionsTweak(opts)
 
-	switch normalizedWatchMode(opts.watchMode) {
-	case watchModeFull:
-		return dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynamicClient, 0, namespace, tweakListOptions), nil
-	case watchModeMetadata:
-		metadataClient, err := metadata.NewForConfig(config)
-		if err != nil {
-			return nil, fmt.Errorf("can't create metadata client: %w", err)
+	buildFactory := func(factoryNamespace string) (resourceInformerFactory, error) {
+		switch normalizedWatchMode(opts.watchMode) {
+		case watchModeFull:
+			return dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynamicClient, 0, factoryNamespace, tweakListOptions), nil
+		case watchModeMetadata:
+			metadataClient, err := metadata.NewForConfig(config)
+			if err != nil {
+				return nil, fmt.Errorf("can't create metadata client: %w", err)
+			}
+			return metadatainformer.NewFilteredSharedInformerFactory(metadataClient, 0, factoryNamespace, tweakListOptions), nil
+		default:
+			return nil, fmt.Errorf("unsupported watch mode %q", opts.watchMode)
 		}
-		return metadatainformer.NewFilteredSharedInformerFactory(metadataClient, 0, namespace, tweakListOptions), nil
-	default:
-		return nil, fmt.Errorf("unsupported watch mode %q", opts.watchMode)
 	}
+
+	if namespace == v1.NamespaceAll {
+		return buildFactory(namespace)
+	}
+
+	namespacedFactory, err := buildFactory(namespace)
+	if err != nil {
+		return nil, err
+	}
+
+	clusterFactory, err := buildFactory(v1.NamespaceAll)
+	if err != nil {
+		return nil, err
+	}
+
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("can't create discovery client: %w", err)
+	}
+
+	return &scopeAwareResourceInformerFactory{
+		namespacedFactory: namespacedFactory,
+		clusterFactory:    clusterFactory,
+		discoveryClient:   discoveryClient,
+		namespacedByGVR:   make(map[schema.GroupVersionResource]bool),
+	}, nil
 }
 
 type resourceDiscoveryClient interface {
