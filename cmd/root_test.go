@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -309,9 +310,38 @@ func TestMetadataDiffRecorderFetchesOnlyHotObjects(t *testing.T) {
 		t.Fatalf("second diff should include full object change: %s", history.Diffs[1])
 	}
 
-	snapshots := recorder.snapshots[deploymentGVR][resourceKey(fourth)]
-	if len(snapshots) > 3 {
-		t.Fatalf("snapshot count = %d, want at most 3", len(snapshots))
+	if snapshots := recorder.snapshotCount(deploymentGVR, resourceKey(fourth)); snapshots > 3 {
+		t.Fatalf("snapshot count = %d, want at most 3", snapshots)
+	}
+}
+
+func TestMetadataDiffRecorderAllowsConcurrentCapture(t *testing.T) {
+	tracker := NewChangeTracker(signalResourceVersion, 0, 5)
+	getter := &concurrentFullObjectGetter{obj: testObject("default", "api", "10", 1, "nginx:2")}
+	recorder := newMetadataDiffRecorder(getter, tracker, 5)
+
+	obj := testMetadataObject("default", "api", "uid-api", "10", 1)
+	tracker.ObserveAdd(deploymentGVR, obj)
+	observation := Observation{
+		Key:     resourceKey(obj),
+		ID:      resourceID(obj),
+		Count:   2,
+		Changed: true,
+		Hot:     true,
+	}
+
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			recorder.Capture(context.Background(), deploymentGVR, obj, observation)
+		}()
+	}
+	wg.Wait()
+
+	if snapshots := recorder.snapshotCount(deploymentGVR, resourceKey(obj)); snapshots > 6 {
+		t.Fatalf("snapshot count = %d, want at most 6", snapshots)
 	}
 }
 
@@ -364,4 +394,18 @@ func (f *fakeFullObjectGetter) Get(ctx context.Context, gvr schema.GroupVersionR
 	obj := f.objects[0]
 	f.objects = f.objects[1:]
 	return obj, nil
+}
+
+type concurrentFullObjectGetter struct {
+	lock  sync.Mutex
+	count int
+	obj   *unstructured.Unstructured
+}
+
+func (f *concurrentFullObjectGetter) Get(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, error) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+
+	f.count++
+	return f.obj.DeepCopy(), nil
 }

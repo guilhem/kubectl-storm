@@ -25,6 +25,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -203,17 +204,23 @@ func run(ctx context.Context, config *rest.Config, opts runOptions) error {
 	}
 
 	watchCtx, cancelWatch := context.WithCancel(ctx)
-	defer func() {
-		cancelWatch()
-		factory.Shutdown()
-	}()
+	var stopWatchesOnce sync.Once
+	stopWatches := func() {
+		stopWatchesOnce.Do(func() {
+			cancelWatch()
+			factory.Shutdown()
+		})
+	}
+	defer stopWatches()
 
 	factory.Start(watchCtx.Done())
 	if !waitForInformerSync(watchCtx, factory, handlerSyncs) {
+		stopWatches()
 		return DisplayDiffs(tracker.Snapshot())
 	}
 
 	waitForRunDuration(ctx, opts.runDuration)
+	stopWatches()
 	return DisplayDiffs(tracker.Snapshot())
 }
 
@@ -560,6 +567,7 @@ type metadataDiffRecorder struct {
 	getter       fullObjectGetter
 	tracker      *ChangeTracker
 	maxSnapshots int
+	lock         sync.Mutex
 	snapshots    map[schema.GroupVersionResource]map[string][]any
 }
 
@@ -577,14 +585,7 @@ func (r *metadataDiffRecorder) Capture(ctx context.Context, gvr schema.GroupVers
 		return
 	}
 
-	resourceSnapshots := r.snapshots[gvr]
-	if resourceSnapshots == nil {
-		resourceSnapshots = make(map[string][]any)
-		r.snapshots[gvr] = resourceSnapshots
-	}
-
-	snapshots := resourceSnapshots[observation.Key]
-	if len(snapshots) >= r.maxSnapshots {
+	if r.snapshotCount(gvr, observation.Key) >= r.maxSnapshots {
 		return
 	}
 
@@ -595,15 +596,43 @@ func (r *metadataDiffRecorder) Capture(ctx context.Context, gvr schema.GroupVers
 	}
 
 	snapshot := sanitizeForDiff(r.tracker.signal, fullObj)
-	if len(snapshots) == 0 {
-		resourceSnapshots[observation.Key] = append(snapshots, snapshot)
-		r.tracker.AddDiff(gvr, observation.Key, "metadata mode: captured first full snapshot; diff will be available after the next hot change")
+	diff, ok := r.appendSnapshot(gvr, observation.Key, snapshot)
+	if !ok {
 		return
+	}
+	r.tracker.AddDiff(gvr, observation.Key, diff)
+}
+
+func (r *metadataDiffRecorder) snapshotCount(gvr schema.GroupVersionResource, key string) int {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	return len(r.snapshots[gvr][key])
+}
+
+func (r *metadataDiffRecorder) appendSnapshot(gvr schema.GroupVersionResource, key string, snapshot any) (string, bool) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	resourceSnapshots := r.snapshots[gvr]
+	if resourceSnapshots == nil {
+		resourceSnapshots = make(map[string][]any)
+		r.snapshots[gvr] = resourceSnapshots
+	}
+
+	snapshots := resourceSnapshots[key]
+	if len(snapshots) >= r.maxSnapshots {
+		return "", false
+	}
+
+	if len(snapshots) == 0 {
+		resourceSnapshots[key] = append(snapshots, snapshot)
+		return "metadata mode: captured first full snapshot; diff will be available after the next hot change", true
 	}
 
 	previous := snapshots[len(snapshots)-1]
-	resourceSnapshots[observation.Key] = append(snapshots, snapshot)
-	r.tracker.AddDiff(gvr, observation.Key, diffSanitized(previous, snapshot))
+	resourceSnapshots[key] = append(snapshots, snapshot)
+	return diffSanitized(previous, snapshot), true
 }
 
 func waitForInformerSync(ctx context.Context, factory resourceInformerFactory, handlerSyncs []cache.InformerSynced) bool {
