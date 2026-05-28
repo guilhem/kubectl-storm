@@ -44,27 +44,28 @@ func defaultExcludedResources() []string {
 }
 
 func parseResourceFilter(value string) (schema.GroupVersionResource, error) {
-	parts := strings.Split(value, "/")
-	if len(parts) != 3 {
+	resourceSeparator := strings.LastIndex(value, "/")
+	if resourceSeparator < 0 {
 		return schema.GroupVersionResource{}, fmt.Errorf("resource filter %q must use group/version/resource", value)
 	}
 
-	group := parts[0]
-	if group == "core" {
-		group = ""
-	}
-
-	gvr := schema.GroupVersionResource{
-		Group:    group,
-		Version:  parts[1],
-		Resource: parts[2],
-	}
-
-	if gvr.Version == "" || gvr.Resource == "" {
+	groupVersion := value[:resourceSeparator]
+	resource := value[resourceSeparator+1:]
+	if !strings.Contains(groupVersion, "/") || resource == "" {
 		return schema.GroupVersionResource{}, fmt.Errorf("resource filter %q must include version and resource", value)
 	}
 
-	return gvr, nil
+	groupVersion = strings.TrimPrefix(groupVersion, "/")
+	groupVersion = strings.TrimPrefix(groupVersion, "core/")
+
+	gv, err := schema.ParseGroupVersion(groupVersion)
+	if err != nil {
+		return schema.GroupVersionResource{}, fmt.Errorf("resource filter %q has invalid group/version: %w", value, err)
+	}
+	if gv.Version == "" {
+		return schema.GroupVersionResource{}, fmt.Errorf("resource filter %q must include version and resource", value)
+	}
+	return gv.WithResource(resource), nil
 }
 
 func (m resourceMatcher) Empty() bool {
