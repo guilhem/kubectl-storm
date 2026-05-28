@@ -348,7 +348,7 @@ func listOptionsTweak(opts runOptions) func(*v1.ListOptions) {
 		if opts.fieldSelector != "" {
 			listOptions.FieldSelector = opts.fieldSelector
 		}
-		if opts.watchListLimit > 0 {
+		if opts.watchListLimit > 0 && !listOptions.Watch {
 			listOptions.Limit = opts.watchListLimit
 		}
 	}
